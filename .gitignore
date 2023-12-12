@@ -1,3 +1,5 @@
 exp
 tmp
+results_adapt
+results
 *.pt
