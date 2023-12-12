@@ -10,13 +10,15 @@ import torch.utils.data as data
 
 from datasets import get_dataset, data_transform, inverse_data_transform
 from functions.ckpt_util import get_ckpt_path, download
-from functions.svd_ddnm import ddnm_diffusion, dps_diffusion, pigdm_diffusion, dds_diffusion
+from functions.svd_adapt import ddnm_diffusion
 
 import torchvision.utils as tvu
 
 from guided_diffusion.models import Model
 from guided_diffusion.script_util import create_model, create_classifier, classifier_defaults, args_to_dict
 import random
+
+from adapt.adaptation import _score_model_adpt
 
 from scipy.linalg import orth
 
@@ -135,30 +137,56 @@ class Diffusion(object):
                              ckpt)
             else:
                 raise ValueError
-            ckpt_dict = torch.load(ckpt, map_location=self.device)
-            ckpt_dict.pop("label_emb.weight")
-            model.load_state_dict(ckpt_dict)
+            model.load_state_dict(torch.load(ckpt, map_location=self.device))
             model.to(self.device)
             model = torch.nn.DataParallel(model)
 
         elif self.config.model.type == 'openai':
             config_dict = vars(self.config.model)
             model = create_model(**config_dict)
-            if self.config.model.use_fp16:
-                model.convert_to_fp16()
-            
-            if self.config.model.image_size == 256:
+            if self.config.model.class_cond:
+                ckpt = os.path.join(self.args.exp, 'logs/imagenet/%dx%d_diffusion.pt' % (
+                self.config.data.image_size, self.config.data.image_size))
+                if not os.path.exists(ckpt):
+                    download(
+                        'https://openaipublic.blob.core.windows.net/diffusion/jul-2021/%dx%d_diffusion_uncond.pt' % (
+                        self.config.data.image_size, self.config.data.image_size), ckpt)
+            else:
                 ckpt = os.path.join(self.args.exp, "logs/imagenet/256x256_diffusion_uncond.pt")
-            elif self.config.model.image_size == 512:
-                ckpt = os.path.join(self.args.exp, "logs/imagenet/512x512_diffusion_uncond.pt")
-            print(f"Model loaded from {ckpt}!")
+                if not os.path.exists(ckpt):
+                    download(
+                        'https://openaipublic.blob.core.windows.net/diffusion/jul-2021/256x256_diffusion_uncond.pt',
+                        ckpt)
 
-            ckpt_dict = torch.load(ckpt, map_location=self.device)
-            ckpt_dict.pop("label_emb.weight")
-            model.load_state_dict(ckpt_dict)
+            model.load_state_dict(torch.load(ckpt, map_location=self.device))
             model.to(self.device)
             model.eval()
             model = torch.nn.DataParallel(model)
+
+            if self.config.model.class_cond:
+                ckpt = os.path.join(self.args.exp, 'logs/imagenet/%dx%d_classifier.pt' % (
+                self.config.data.image_size, self.config.data.image_size))
+                if not os.path.exists(ckpt):
+                    image_size = self.config.data.image_size
+                    download(
+                        'https://openaipublic.blob.core.windows.net/diffusion/jul-2021/%dx%d_classifier.pt' % image_size,
+                        ckpt)
+                classifier = create_classifier(**args_to_dict(self.config.classifier, classifier_defaults().keys()))
+                classifier.load_state_dict(torch.load(ckpt, map_location=self.device))
+                classifier.to(self.device)
+                classifier.eval()
+                classifier = torch.nn.DataParallel(classifier)
+
+                import torch.nn.functional as F
+                def cond_fn(x, t, y):
+                    with torch.enable_grad():
+                        x_in = x.detach().requires_grad_(True)
+                        logits = classifier(x_in, t)
+                        log_probs = F.log_softmax(logits, dim=-1)
+                        selected = log_probs[range(len(logits)), y.view(-1)]
+                        return torch.autograd.grad(selected.sum(), x_in)[0] * self.config.classifier.classifier_scale
+
+                cls_fn = cond_fn
 
         if simplified:
             print('Run Simplified DDNM, without SVD.',
@@ -176,6 +204,17 @@ class Diffusion(object):
                   f'Task: {self.args.deg}.'
                  )
             self.svd_based_ddnm_plus(model, cls_fn)
+            
+    def redefine_model(self):
+        cls_fn = None
+        config_dict = vars(self.config.model)
+        model = create_model(**config_dict)
+        ckpt = os.path.join(self.args.exp, self.args.ckpt_load_name)
+        model.load_state_dict(torch.load(ckpt, map_location=self.device))
+        print(f"Model ckpt loaded from {ckpt}")
+        model.to(self.device)
+        model.eval()
+        return model
             
             
     def simplified_ddnm_plus(self, model, cls_fn):
@@ -269,7 +308,23 @@ class Diffusion(object):
         idx_so_far = args.subset_start
         avg_psnr = 0.0
         pbar = tqdm.tqdm(val_loader)
+        
+        model = _score_model_adpt(
+            model, 
+            method=self.args.adapt_method,
+            r=self.args.lora_rank,
+        )
+        
         for x_orig, classes in pbar:
+            # reinitialize model for every iteration
+            model = self.redefine_model()
+            # inject trainable parameters
+            model = _score_model_adpt(
+                model, 
+                method=self.args.adapt_method,
+                r=self.args.lora_rank,
+            )
+            
             x_orig = x_orig.to(self.device)
             x_orig = data_transform(self.config, x_orig)
 
@@ -367,7 +422,7 @@ class Diffusion(object):
                 x = xs[-1]
                 
             x = [inverse_data_transform(config, xi) for xi in x]
-
+            import ipdb; ipdb.set_trace()
             tvu.save_image(
                 x[0], os.path.join(self.args.image_folder, f"{idx_so_far + j}_{0}.png")
             )
@@ -387,7 +442,6 @@ class Diffusion(object):
         
 
     def svd_based_ddnm_plus(self, model, cls_fn):
-        import ipdb; ipdb.set_trace()
         args, config = self.args, self.config
 
         dataset, test_dataset = get_dataset(args, config)
@@ -447,9 +501,12 @@ class Diffusion(object):
             from functions.svd_operators import Colorization
             A_funcs = Colorization(config.data.image_size, self.device)
         elif deg == 'sr_averagepooling':
-            blur_by = int(args.deg_scale)
-            from functions.svd_operators import SuperResolution
-            A_funcs = SuperResolution(config.data.channels, config.data.image_size, blur_by, self.device)
+            # blur_by = int(args.deg_scale)
+            # from functions.svd_operators import SuperResolution
+            # A_funcs = SuperResolution(config.data.channels, config.data.image_size, blur_by, self.device)
+            scale=round(args.deg_scale)
+            A = torch.nn.AdaptiveAvgPool2d((256//scale,256//scale))
+            Ap = lambda z: MeanUpsample(z,scale)
         elif deg == 'sr_bicubic':
             factor = int(args.deg_scale)
             from functions.svd_operators import SRConv
@@ -504,7 +561,7 @@ class Diffusion(object):
             x_orig = x_orig.to(self.device)
             x_orig = data_transform(self.config, x_orig)
 
-            y = A_funcs.A(x_orig)
+            y = A(x_orig)
             
             b, hwc = y.size()
             if 'color' in deg:
@@ -523,8 +580,8 @@ class Diffusion(object):
             
             y = y.reshape((b, hwc))
 
-            Apy = A_funcs.A_pinv(y).view(y.shape[0], config.data.channels, self.config.data.image_size,
-                                                self.config.data.image_size)
+            Apy = A_pinv(y).view(y.shape[0], config.data.channels, self.config.data.image_size,
+                                 self.config.data.image_size)
 
             if deg[:6] == 'deblur':
                 Apy = y.view(y.shape[0], config.data.channels, self.config.data.image_size,
@@ -554,15 +611,10 @@ class Diffusion(object):
                 device=self.device,
             )
 
-            if self.args.method == "ddnm":
-                with torch.no_grad():
-                    x, _ = ddnm_diffusion(x, model, self.betas, self.args.eta, A_funcs, y, cls_fn=cls_fn, classes=classes, config=config)
-            elif self.args.method == "dps":
-                x, _ = dps_diffusion(x, model, self.betas, self.args.eta, A_funcs, y, cls_fn=cls_fn, classes=classes, config=config)
-            elif self.args.method == "dds":
-                x, _ = dds_diffusion(x, model, self.betas, self.args.eta, A_funcs, y, cls_fn=cls_fn, classes=classes, config=config)
-            elif self.args.method == "pigdm":
-                x, _ = pigdm_diffusion(x, model, self.betas, self.args.eta, A_funcs, y, sigma_y, cls_fn=cls_fn, classes=classes, config=config)
+            if sigma_y==0.: # noise-free case, turn to ddnm
+                x, _ = ddnm_diffusion(x, model, self.betas, self.args.eta, A, 
+                                      A_pinv, y, cls_fn=cls_fn, classes=classes, 
+                                      args=self.args, config=config)
 
             x = [inverse_data_transform(config, xi) for xi in x]
 

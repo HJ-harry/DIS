@@ -9,8 +9,10 @@ import torch
 import numpy as np
 import torch.utils.tensorboard as tb
 
-# from runners.diffusion import Diffusion
 from guided_diffusion.diffusion import Diffusion
+from guided_diffusion.diffusion_adapt import Diffusion as Diffusion_adapt
+
+from pathlib import Path
 
 torch.set_printoptions(sci_mode=False)
 
@@ -84,6 +86,73 @@ def parse_args_and_config():
         "--add_noise",
         action="store_true"
     )
+    # adaptation parameters
+    parser.add_argument(
+        "--use_adapt",
+        action="store_true"
+    )
+    parser.add_argument(
+        "--use_additional_dc",
+        action="store_true",
+        help="when using adaptation, additionally use projection w.r.t. y?"
+    )
+    parser.add_argument(
+        "--adapt_method", 
+        type=str, 
+        default="lora", 
+        help="Method of adaptation"
+    )
+    parser.add_argument(
+        "--lora_rank", 
+        type=int, 
+        default=4, 
+        help="Rank used in LoRA parameter injection"
+    )
+    parser.add_argument(
+        "--tv_penalty", 
+        type=float, 
+        default=0.0,
+        help="Additional TV penalty when applying adaptation. \
+            If you want to use this, set this to a very low value e.g. 1e-6."
+    )
+    parser.add_argument(
+        "--adapt_lr", 
+        type=float, 
+        default=1e-3,
+        help="5e-5 for decoder, 1e-3 for lora"
+    )
+    parser.add_argument(
+        "--adapt_iter", 
+        type=int, 
+        default=10,
+        help="5 for decoder, 10 for lora"
+    )
+    parser.add_argument(
+        "--ddim_eps_choice", 
+        type=str, 
+        default="adapt",
+        help="One of [adapt, old]. If adapt, use eps_pred from the online adapted model for DDIM noise addition. \
+              If old, use the old non-adapted model for this. This would require an additional NFE per iteration."
+    )
+    parser.add_argument(
+        "--use_dc_before_adapt", 
+        action="store_true",
+        help="If true, minimize ||A(DC(x0hat)) - y||^2, where DC is some gradient descent step"
+    )
+    parser.add_argument(
+        "--dc_before_adapt_method", 
+        type=str,
+        default="dds",
+        help="which type of gradient descent step to take before adaptation. one of [dps, dds]."
+    )
+    parser.add_argument(
+        "--T_sampling", type=int, default=50, help="Total number of sampling steps"
+    )
+    parser.add_argument(
+        "--method", 
+        type=str,
+        default="ddnm",
+    )
 
     
 
@@ -107,29 +176,24 @@ def parse_args_and_config():
     logger.addHandler(handler1)
     logger.setLevel(level)
 
-    os.makedirs(os.path.join(args.exp, "image_samples"), exist_ok=True)
-    args.image_folder = os.path.join(
-        args.exp, "image_samples", args.image_folder
-    )
+    use_adapt = True if args.use_adapt else False
+    use_additional_dc = True if args.use_additional_dc else False
+    use_dc_before_adapt = True if args.use_dc_before_adapt else False
+    am = args.adapt_method
+    print(f"Use Adaptation? {use_adapt}")
+    if use_adapt:
+        args.image_folder = Path(args.image_folder) / f"{args.deg}" / f"x{args.deg_scale}" / f"{args.T_sampling}" \
+                            / f"adapt_{use_adapt}" / f"iter_{args.adapt_iter}_lr{args.adapt_lr}_tv{args.tv_penalty}"
+    else:
+        args.image_folder = Path(args.image_folder) / f"{args.deg}" / f"x{args.deg_scale}" / f"{args.T_sampling}" \
+                            / f"adapt_{use_adapt}"
+    args.image_folder.mkdir(exist_ok=True, parents=True)
+    
+    
     if not os.path.exists(args.image_folder):
         os.makedirs(args.image_folder)
     else:
         overwrite = False
-        if args.ni:
-            overwrite = True
-        else:
-            response = input(
-                f"Image folder {args.image_folder} already exists. Overwrite? (Y/N)"
-            )
-            if response.upper() == "Y":
-                overwrite = True
-
-        if overwrite:
-            shutil.rmtree(args.image_folder)
-            os.makedirs(args.image_folder)
-        else:
-            print("Output image folder exists. Program halted.")
-            sys.exit(0)
 
     # add device
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -162,7 +226,11 @@ def main():
     args, config = parse_args_and_config()
 
     try:
-        runner = Diffusion(args, config)
+        if args.use_adapt:
+            print(f"Using adaptation...")
+            runner = Diffusion_adapt(args, config)
+        else:
+            runner = Diffusion(args, config)
         runner.sample(args.simplified)
     except Exception:
         logging.error(traceback.format_exc())
